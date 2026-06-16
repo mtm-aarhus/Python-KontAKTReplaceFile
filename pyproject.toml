@@ -19,7 +19,7 @@ dependencies = [
     "OpenOrchestrator == 3.*",
     "oomtm @ git+https://github.com/mtm-aarhus/oomtm.git@main",
     "requests >= 2.31",
-    "Pillow >= 10",
+    "Pillow == 10.*",
 ]
 # oomtm provides the SharePoint upload/delete. The file is already redacted by a
 # human in an external program, so there is no PDF/OCR work in this robot — it
