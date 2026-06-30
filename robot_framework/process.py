@@ -16,8 +16,16 @@ Queue-driven, one queue element per document. For a single document it:
   5. reports back to KontAKT (new URL + filename + hash + size; the document is
      marked 'redacted' and KontAKT's cache is busted).
 
+It also has a lightweight **rename** mode (``"mode": "rename"``): when a
+caseworker renames a document in KontAKT (to redact a sensitive title), this
+renames the matching SharePoint file in place to ``{akt} - {dok} - {name}`` —
+rebuilding the leaf exactly like the to-PDF robots. It reads the current display
+name from KontAKT, so coalesced renames land on the latest, and reports the new
+URL/filename back (content unchanged). No staged file involved.
+
 Queue payload (set by KontAKT's "Redigér manuelt" upload):
-    {"kontakt_case_id": 11, "doc_id": 42}
+    {"kontakt_case_id": 11, "doc_id": 42}                     # replace (default)
+    {"kontakt_case_id": 11, "doc_id": 42, "mode": "rename"}   # rename to match display name
 
 OO config:
     Constant   KontAKTSharePoint      — SharePoint site URL
@@ -54,8 +62,23 @@ def process(
     payload = json.loads(queue_element.data or "{}")
     case_id = int(payload["kontakt_case_id"])
     doc_id = int(payload["doc_id"])
-    orchestrator_connection.log_info(f"Replace file case={case_id} doc={doc_id}")
+    mode = (payload.get("mode") or "replace").strip()
 
+    # Rename mode: rename the SharePoint file to match the document's display name
+    # (rename-to-redact). Distinct callback — content is unchanged.
+    if mode == "rename":
+        orchestrator_connection.log_info(f"Rename file case={case_id} doc={doc_id}")
+        try:
+            result = _rename(orchestrator_connection, client, case_id, doc_id)
+        except Exception as exc:
+            orchestrator_connection.log_info(f"Rename failed: {exc!r}")
+            _rename_callback(orchestrator_connection, client, case_id, doc_id, {"ok": False, "note": str(exc)[:500]})
+            raise
+        _rename_callback(orchestrator_connection, client, case_id, doc_id, result)
+        orchestrator_connection.log_info(f"Rename done doc={doc_id}: ok={result.get('ok')}")
+        return
+
+    orchestrator_connection.log_info(f"Replace file case={case_id} doc={doc_id}")
     try:
         result = _replace(orchestrator_connection, client, case_id, doc_id)
     except Exception as exc:
@@ -102,6 +125,42 @@ def _replace(orchestrator_connection, client, case_id, doc_id):
             "sha256": sha, "file_size_bytes": size}
 
 
+def _rename(orchestrator_connection, client, case_id, doc_id):
+    """Rename the document's SharePoint file to ``{akt} - {dok} - {display name}``
+    (same folder, same extension), rebuilding the leaf exactly like the to-PDF
+    robots so it stays consistent. Reads the current name from KontAKT, so a
+    coalesced burst of renames just lands on the latest."""
+    info = _fetch_rename_info(client, case_id, doc_id)
+    url = (info.get("sharepoint_url") or "").strip()
+    akt = info.get("akt_id")
+    dok = info.get("dok_id")
+    new_title = (info.get("new_title") or "").strip()
+    if not url:
+        return {"ok": False, "note": "Dokumentet har ingen SharePoint-fil at omdøbe."}
+    if akt is None or not new_title:
+        return {"ok": False, "note": "Mangler Akt ID eller navn til omdøbning."}
+
+    server_relative = unquote(urlparse(url).path)
+    folder = posixpath.dirname(server_relative)
+    old_leaf = posixpath.basename(server_relative)
+    ext = posixpath.splitext(old_leaf)[1].lstrip(".")
+    # Rebuild the leaf exactly like the to-PDF robots: sanitize → truncate to the
+    # SharePoint path limit (using this file's own folder) → build_filename.
+    undermappe = posixpath.basename(folder)
+    overmappe = posixpath.basename(posixpath.dirname(folder))
+    base_path = posixpath.dirname(posixpath.dirname(folder)).lstrip("/") + "/"
+    safe = sp.sanitize_title(new_title)
+    safe = sp.truncate_title(safe, base_path=base_path, overmappe=overmappe,
+                             undermappe=undermappe, akt_id=akt, dok_id=dok)
+    new_leaf = sp.build_filename(akt, dok, safe, ext)
+    if new_leaf == old_leaf:
+        return {"ok": True, "sharepoint_url": url, "filename": old_leaf}
+
+    sp.rename_file(client.sp_ctx, server_relative, new_leaf)
+    new_url = url.rsplit("/", 1)[0] + "/" + quote(new_leaf)
+    return {"ok": True, "sharepoint_url": new_url, "filename": new_leaf}
+
+
 def _sha256_hex(path: Path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as fh:
@@ -122,6 +181,28 @@ def _fetch_info(client, case_id, doc_id):
     )
     r.raise_for_status()
     return r.json()
+
+
+def _fetch_rename_info(client, case_id, doc_id):
+    """GET the current SharePoint URL + Akt/Dok ID + display name to rename to."""
+    r = requests.get(
+        f"{client.kontakt_base}/api/v1/cases/{case_id}/documents/{doc_id}/rename-info",
+        headers={"X-API-Key": client.kontakt_key},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def _rename_callback(orchestrator_connection, client, case_id: int, doc_id: int, body: dict) -> None:
+    try:
+        requests.post(
+            f"{client.kontakt_base}/api/v1/cases/{case_id}/documents/{doc_id}/file-renamed",
+            headers={"X-API-Key": client.kontakt_key, "Content-Type": "application/json"},
+            json=body, timeout=30,
+        )
+    except Exception as exc:  # pylint: disable=broad-except
+        orchestrator_connection.log_info(f"Rename callback to KontAKT failed: {exc!r}")
 
 
 def _download_staged(client, case_id, doc_id, dst: Path) -> None:
